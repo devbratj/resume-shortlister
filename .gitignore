@@ -1,0 +1,8 @@
+.env
+.venv/
+gcp-key.json
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.idea/
+.vscode/
