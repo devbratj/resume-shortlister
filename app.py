@@ -244,6 +244,56 @@ def process_all_resumes_concurrently(client, jd_text: str, min_reqs: str, resume
                 
     return results
 
+def get_genai_client() -> Optional[genai.Client]:
+    """Automatically detects available credentials and returns an initialized GenAI Client."""
+    # 1. Check for Service Account in Streamlit Secrets
+    if "gcp_service_account" in st.secrets:
+        import tempfile
+        import json
+        secret_data = st.secrets["gcp_service_account"]
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
+            if isinstance(secret_data, str):
+                temp_file.write(secret_data)
+            else:
+                json.dump(dict(secret_data), temp_file)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file.name
+        
+        # Load project ID from secrets if available
+        project_id = "akansha-academy-001"
+        try:
+            if isinstance(secret_data, str):
+                parsed = json.loads(secret_data)
+            else:
+                parsed = dict(secret_data)
+            project_id = parsed.get("project_id", project_id)
+        except:
+            pass
+            
+        return genai.Client(vertexai=True, project=project_id, location="us-central1")
+        
+    # 2. Check for local gcp-key.json file
+    elif os.path.exists("gcp-key.json"):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("gcp-key.json")
+        project_id = "akansha-academy-001"
+        try:
+            with open("gcp-key.json", "r") as f:
+                parsed = json.load(f)
+                project_id = parsed.get("project_id", project_id)
+        except:
+            pass
+        return genai.Client(vertexai=True, project=project_id, location="us-central1")
+        
+    # 3. Check for API Key (in environment variables or Streamlit secrets)
+    else:
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key and "GEMINI_API_KEY" in st.secrets:
+            api_key = st.secrets["GEMINI_API_KEY"]
+            
+        if api_key:
+            return genai.Client(api_key=api_key)
+            
+    return None
+
 # --- Main App ---
 def main():
     st.title("⚡ AI Resume Shortlister")
@@ -257,53 +307,6 @@ def main():
 
     # --- Sidebar Settings ---
     with st.sidebar:
-        st.header("⚙️ Configuration")
-        auth_method = st.selectbox(
-            "Authentication Method",
-            ["API Key (Google AI Studio)", "Service Account (Vertex AI)"],
-            help="Choose how you want to authenticate with Gemini."
-        )
-        
-        if auth_method == "API Key (Google AI Studio)":
-            # Prefill from environment variable or Streamlit Secrets
-            default_key = os.getenv("GEMINI_API_KEY", "")
-            if not default_key and "GEMINI_API_KEY" in st.secrets:
-                default_key = st.secrets["GEMINI_API_KEY"]
-                
-            api_key_input = st.text_input(
-                "Google GenAI API Key", 
-                value=default_key, 
-                type="password",
-                help="Get it from Google AI Studio. Uses .env or Secrets if available."
-            )
-            gcp_project = ""
-            gcp_location = ""
-            gcp_key_path = ""
-        else:
-            api_key_input = ""
-            gcp_project = st.text_input(
-                "GCP Project ID",
-                value="akansha-academy-001",
-                help="Your Google Cloud project ID."
-            )
-            gcp_location = st.text_input(
-                "GCP Region",
-                value="us-central1",
-                help="The region where Vertex AI will be called."
-            )
-            # Default helper message if service account is in secrets
-            has_secret_key = "gcp_service_account" in st.secrets
-            default_key_path = "" if has_secret_key else "gcp-key.json"
-            help_msg = "Service account key will be loaded from Streamlit Secrets." if has_secret_key else "Path to your downloaded service account JSON key file (e.g. gcp-key.json in the project root)."
-            
-            gcp_key_path = st.text_input(
-                "Service Account JSON Key File Path",
-                value=default_key_path,
-                help=help_msg
-            )
-            
-        st.divider()
-        
         st.header("📄 Inputs")
         
         jd_file = st.file_uploader("Upload Job Description (PDF/DOCX/TXT)", type=['pdf', 'docx', 'txt'])
@@ -324,29 +327,6 @@ def main():
 
     # --- Actions ---
     if process_btn:
-        if auth_method == "API Key (Google AI Studio)" and not api_key_input:
-            # Fallback if secrets is set but input wasn't filled
-            if "GEMINI_API_KEY" in st.secrets:
-                api_key_input = st.secrets["GEMINI_API_KEY"]
-            else:
-                st.error("Please provide a Gemini API Key.")
-                return
-        elif auth_method == "Service Account (Vertex AI)":
-            if not gcp_project:
-                st.error("Please provide a GCP Project ID.")
-                return
-            if not gcp_location:
-                st.error("Please provide a GCP Region.")
-                return
-            # Only check local key file if key is not provided via Secrets
-            if "gcp_service_account" not in st.secrets:
-                if gcp_key_path and not os.path.exists(gcp_key_path):
-                    st.error(f"Service account key file not found at: {gcp_key_path}")
-                    return
-                elif not gcp_key_path:
-                    st.error("Please provide a Service Account JSON Key File Path or configure gcp_service_account in Secrets.")
-                    return
-                
         if not (jd_file or jd_text_manual):
             st.error("Please provide a Job Description.")
             return
@@ -360,30 +340,17 @@ def main():
             st.warning("You uploaded more than 20 resumes. Only processing the first 20.")
             resumes = resumes[:20]
             
+        # Initialize client using auto-detection
+        client = get_genai_client()
+        if not client:
+            st.error("No authentication credentials found. Please set `GEMINI_API_KEY` or `gcp_service_account` in your Streamlit secrets or environment variables.")
+            return
+            
         # Prepare inputs
         st.session_state['evaluations'] = []
         st.session_state['selected_candidate'] = None
         
         jd_text = extract_text(jd_file) if jd_file else jd_text_manual
-        
-        # Initialize client based on auth method
-        if auth_method == "API Key (Google AI Studio)":
-            client = genai.Client(api_key=api_key_input)
-        else:
-            # Handle Service Account JSON key from Streamlit Secrets or local file
-            if "gcp_service_account" in st.secrets:
-                import tempfile
-                import json
-                secret_data = st.secrets["gcp_service_account"]
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
-                    if isinstance(secret_data, str):
-                        temp_file.write(secret_data)
-                    else:
-                        json.dump(dict(secret_data), temp_file)
-                    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file.name
-            elif gcp_key_path:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(gcp_key_path)
-            client = genai.Client(vertex=True, project=gcp_project, location=gcp_location)
         
         # Process
         results = process_all_resumes_concurrently(client, jd_text, min_reqs, resumes)
