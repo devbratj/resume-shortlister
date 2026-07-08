@@ -17,6 +17,9 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+# OpenAI / OpenRouter
+from openai import OpenAI
+
 # Load environment variables
 load_dotenv()
 
@@ -171,8 +174,8 @@ def extract_text(file) -> str:
     file.seek(0)
     return text
 
-def process_single_resume(client, resume_text: str, filename: str, jd_text: str, min_reqs: str) -> dict:
-    """Calls Gemini to evaluate a single resume."""
+def process_single_resume(client, provider: str, model_name: str, resume_text: str, filename: str, jd_text: str, min_reqs: str) -> dict:
+    """Calls the selected LLM provider to evaluate a single resume."""
     try:
         prompt = f"""
         You are an expert technical recruiter and hiring manager.
@@ -196,26 +199,47 @@ def process_single_resume(client, resume_text: str, filename: str, jd_text: str,
         Fill out the required JSON schema accurately.
         """
         
-        # Call Gemini 2.5 Flash
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=CandidateEvaluation,
-                temperature=0.1,
-            ),
-        )
-        
-        # Parse output
-        result_dict = json.loads(response.text)
+        if provider == "Gemini":
+            # Call Gemini
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CandidateEvaluation,
+                    temperature=0.1,
+                ),
+            )
+            result_dict = json.loads(response.text)
+        elif provider in ["OpenAI", "OpenRouter"]:
+            # Call OpenAI / OpenRouter
+            schema_dict = CandidateEvaluation.model_json_schema()
+            full_prompt = f"""
+            {prompt}
+            
+            Return the output strictly as a JSON object matching this schema:
+            {json.dumps(schema_dict, indent=2)}
+            """
+            
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "user", "content": full_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            result_dict = json.loads(response.choices[0].message.content)
+        else:
+            raise ValueError(f"Unknown provider: {provider}")
+            
         result_dict['filename'] = filename
         return {"status": "success", "data": result_dict}
         
     except Exception as e:
         return {"status": "error", "filename": filename, "error": str(e)}
 
-def process_all_resumes_concurrently(client, jd_text: str, min_reqs: str, resumes) -> list:
+def process_all_resumes_concurrently(client, provider: str, model_name: str, jd_text: str, min_reqs: str, resumes) -> list:
     """Process multiple resumes in parallel using ThreadPoolExecutor."""
     results = []
     
@@ -225,10 +249,10 @@ def process_all_resumes_concurrently(client, jd_text: str, min_reqs: str, resume
         text = extract_text(r)
         resume_data.append((r.name, text))
         
-    with st.spinner(f"Analyzing {len(resume_data)} resumes with Gemini 2.5 Flash..."):
+    with st.spinner(f"Analyzing {len(resume_data)} resumes with {provider} ({model_name})..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_resume = {
-                executor.submit(process_single_resume, client, text, name, jd_text, min_reqs): name
+                executor.submit(process_single_resume, client, provider, model_name, text, name, jd_text, min_reqs): name
                 for name, text in resume_data
             }
             
@@ -244,78 +268,256 @@ def process_all_resumes_concurrently(client, jd_text: str, min_reqs: str, resume
                 
     return results
 
-def get_genai_client() -> Optional[genai.Client]:
-    """Automatically detects available credentials and returns an initialized GenAI Client."""
-    # 1. Check for Service Account in Streamlit Secrets
-    if "gcp_service_account" in st.secrets:
-        import tempfile
-        import json
-        secret_data = st.secrets["gcp_service_account"]
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
-            if isinstance(secret_data, str):
-                temp_file.write(secret_data)
-            else:
-                json.dump(dict(secret_data), temp_file)
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file.name
-        
-        # Load project ID from secrets if available
-        project_id = "akansha-academy-001"
-        try:
-            if isinstance(secret_data, str):
-                parsed = json.loads(secret_data)
-            else:
-                parsed = dict(secret_data)
-            project_id = parsed.get("project_id", project_id)
-        except:
-            pass
-            
-        return genai.Client(vertexai=True, project=project_id, location="us-central1")
-        
-    # 2. Check for local gcp-key.json file
-    elif os.path.exists("gcp-key.json"):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("gcp-key.json")
-        project_id = "akansha-academy-001"
-        try:
-            with open("gcp-key.json", "r") as f:
-                parsed = json.load(f)
-                project_id = parsed.get("project_id", project_id)
-        except:
-            pass
-        return genai.Client(vertexai=True, project=project_id, location="us-central1")
-        
-    # 3. Check for API Key (in environment variables or Streamlit secrets)
-    else:
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key and "GEMINI_API_KEY" in st.secrets:
-            api_key = st.secrets["GEMINI_API_KEY"]
-            
+def get_client(provider: str, api_key: str):
+    """Initializes and returns the appropriate client based on the provider and API key."""
+    if provider == "Gemini":
+        # 1. If key is explicitly provided:
         if api_key:
             return genai.Client(api_key=api_key)
             
+        # 2. Check for Service Account in Streamlit Secrets
+        if "gcp_service_account" in st.secrets:
+            import tempfile
+            import json
+            secret_data = st.secrets["gcp_service_account"]
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
+                if isinstance(secret_data, str):
+                    temp_file.write(secret_data)
+                else:
+                    json.dump(dict(secret_data), temp_file)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file.name
+            
+            # Load project ID from secrets if available
+            project_id = "akansha-academy-001"
+            try:
+                if isinstance(secret_data, str):
+                    parsed = json.loads(secret_data)
+                else:
+                    parsed = dict(secret_data)
+                project_id = parsed.get("project_id", project_id)
+            except:
+                pass
+                
+            return genai.Client(vertexai=True, project=project_id, location="us-central1")
+            
+        # 3. Check for local gcp-key.json file
+        elif os.path.exists("gcp-key.json"):
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("gcp-key.json")
+            project_id = "akansha-academy-001"
+            try:
+                with open("gcp-key.json", "r") as f:
+                    parsed = json.load(f)
+                    project_id = parsed.get("project_id", project_id)
+            except:
+                pass
+            return genai.Client(vertexai=True, project=project_id, location="us-central1")
+            
+        # 4. Check for standard env variable or secrets
+        api_key_env = os.getenv("GEMINI_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
+        if api_key_env:
+            return genai.Client(api_key=api_key_env)
+            
+    elif provider == "OpenAI":
+        actual_key = api_key or os.getenv("OPENAI_API_KEY", "") or st.secrets.get("OPENAI_API_KEY", "")
+        if actual_key:
+            return OpenAI(api_key=actual_key)
+            
+    elif provider == "OpenRouter":
+        actual_key = api_key or os.getenv("OPENROUTER_API_KEY", "") or st.secrets.get("OPENROUTER_API_KEY", "")
+        if actual_key:
+            return OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=actual_key,
+                default_headers={
+                    "HTTP-Referer": "http://localhost:8501",
+                    "X-Title": "Intelligent Resume Shortlister",
+                }
+            )
+            
     return None
+
+
+PROFILES_FILE = "profiles.json"
+
+def load_profiles() -> dict:
+    """Loads saved profiles from profiles.json."""
+    if os.path.exists(PROFILES_FILE):
+        try:
+            with open(PROFILES_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            pass
+    return {"default_profile": "None", "profiles": {}}
+
+def save_profile(label: str, jd_text: str, min_reqs: str, is_default: bool):
+    """Saves a profile and optionally sets it as default."""
+    data = load_profiles()
+    if "profiles" not in data:
+        data["profiles"] = {}
+    data["profiles"][label] = {
+        "jd_text": jd_text,
+        "min_reqs": min_reqs
+    }
+    if is_default:
+        data["default_profile"] = label
+    elif data.get("default_profile") == label and not is_default:
+        data["default_profile"] = "None"
+        
+    with open(PROFILES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    st.session_state['profiles'] = data
+    st.session_state['selected_profile'] = label
+
+def delete_profile(label: str):
+    """Deletes a saved profile."""
+    data = load_profiles()
+    if "profiles" in data and label in data["profiles"]:
+        del data["profiles"][label]
+    if data.get("default_profile") == label:
+        data["default_profile"] = "None"
+        
+    with open(PROFILES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    st.session_state['profiles'] = data
+    st.session_state['selected_profile'] = "None"
+
+def on_profile_change():
+    """Callback when selected profile changes to update input fields."""
+    prof_name = st.session_state.get('selected_profile_name')
+    profiles = st.session_state.get('profiles', {}).get('profiles', {})
+    if prof_name in profiles:
+        st.session_state['jd_text_manual'] = profiles[prof_name]['jd_text']
+        st.session_state['min_reqs'] = profiles[prof_name]['min_reqs']
+        st.session_state['selected_profile'] = prof_name
+    else:
+        st.session_state['jd_text_manual'] = ""
+        st.session_state['min_reqs'] = ""
+        st.session_state['selected_profile'] = "None"
+
 
 # --- Main App ---
 def main():
     st.title("⚡ AI Resume Shortlister")
-    st.markdown("Automate candidate screening against your Job Description and Minimum Requirements using **Gemini 2.5 Flash**.")
+    st.markdown("Automate candidate screening against your Job Description and Minimum Requirements using AI.")
     
     # Initialize Session State
     if 'evaluations' not in st.session_state:
         st.session_state['evaluations'] = []
     if 'selected_candidate' not in st.session_state:
         st.session_state['selected_candidate'] = None
+    if 'profiles' not in st.session_state:
+        st.session_state['profiles'] = load_profiles()
+    if 'selected_profile' not in st.session_state:
+        st.session_state['selected_profile'] = st.session_state['profiles'].get('default_profile', 'None')
+        
+    # Pre-populate fields on first load if a default profile is set
+    profiles_data = st.session_state['profiles'].get('profiles', {})
+    default_prof = st.session_state['profiles'].get('default_profile', 'None')
+    if default_prof in profiles_data:
+        if 'jd_text_manual' not in st.session_state:
+            st.session_state['jd_text_manual'] = profiles_data[default_prof]['jd_text']
+        if 'min_reqs' not in st.session_state:
+            st.session_state['min_reqs'] = profiles_data[default_prof]['min_reqs']
+
 
     # --- Sidebar Settings ---
     with st.sidebar:
+        st.header("⚙️ LLM Configuration")
+        provider = st.selectbox(
+            "LLM Provider",
+            options=["Gemini", "OpenAI", "OpenRouter"],
+            index=0,
+            key="llm_provider"
+        )
+        
+        if provider == "Gemini":
+            default_model = "gemini-2.5-flash"
+            env_key = os.getenv("GEMINI_API_KEY", "") or st.secrets.get("GEMINI_API_KEY", "")
+            api_key = st.text_input("Gemini API Key", value=env_key, type="password", help="Leave blank to use environment variable.")
+            model_name = st.text_input("Model Name", value=default_model)
+        elif provider == "OpenAI":
+            default_model = "gpt-4o-mini"
+            env_key = os.getenv("OPENAI_API_KEY", "") or st.secrets.get("OPENAI_API_KEY", "")
+            api_key = st.text_input("OpenAI API Key", value=env_key, type="password", help="Leave blank to use environment variable.")
+            model_name = st.text_input("Model Name", value=default_model)
+        elif provider == "OpenRouter":
+            default_model = "google/gemini-2.5-flash"
+            env_key = os.getenv("OPENROUTER_API_KEY", "") or st.secrets.get("OPENROUTER_API_KEY", "")
+            api_key = st.text_input("OpenRouter API Key", value=env_key, type="password", help="Leave blank to use environment variable.")
+            model_name = st.text_input("Model Name", value=default_model)
+            
+        st.divider()
+        
+        # --- Job Profiles ---
+        st.header("💼 Job Profiles")
+        profiles_dict = st.session_state.get('profiles', {}).get('profiles', {})
+        profile_names = ["None / Custom"] + list(profiles_dict.keys())
+        
+        selected_prof_idx = 0
+        current_sel = st.session_state.get('selected_profile', 'None')
+        if current_sel in profile_names:
+            selected_prof_idx = profile_names.index(current_sel)
+            
+        selected_prof = st.selectbox(
+            "Load Saved Profile",
+            options=profile_names,
+            index=selected_prof_idx,
+            key="selected_profile_name",
+            on_change=on_profile_change
+        )
+        
+        # Profile Management Expander
+        with st.expander("💾 Manage Profiles"):
+            default_label_val = selected_prof if selected_prof != "None / Custom" else ""
+            new_label = st.text_input("Profile Label", value=default_label_val, placeholder="e.g. React Developer")
+            
+            default_profile_name = st.session_state.get('profiles', {}).get('default_profile')
+            is_default = st.checkbox(
+                "Set as Default Profile", 
+                value=(default_profile_name == selected_prof) if selected_prof != "None / Custom" else False
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Save Profile", use_container_width=True):
+                    jd_content = st.session_state.get('jd_text_manual', '').strip()
+                    reqs_content = st.session_state.get('min_reqs', '').strip()
+                    
+                    if not new_label.strip():
+                        st.error("Please enter a profile label.")
+                    elif not jd_content:
+                        st.error("Please enter a Job Description.")
+                    elif not reqs_content:
+                        st.error("Please enter Minimum Requirements.")
+                    else:
+                        save_profile(new_label.strip(), jd_content, reqs_content, is_default)
+                        st.success(f"Profile '{new_label.strip()}' saved!")
+                        st.rerun()
+            with col2:
+                if selected_prof != "None / Custom":
+                    if st.button("Delete Profile", use_container_width=True):
+                        delete_profile(selected_prof)
+                        st.warning(f"Profile '{selected_prof}' deleted.")
+                        st.rerun()
+
+        st.divider()
         st.header("📄 Inputs")
         
         jd_file = st.file_uploader("Upload Job Description (PDF/DOCX/TXT)", type=['pdf', 'docx', 'txt'])
-        jd_text_manual = st.text_area("Or Paste Job Description Here")
+        if jd_file:
+            extracted_jd_text = extract_text(jd_file)
+            st.session_state['jd_text_manual'] = extracted_jd_text
+            
+        jd_text_manual = st.text_area("Or Paste Job Description Here", key="jd_text_manual")
         
         st.divider()
-        min_reqs = st.text_area("Mandatory Minimum Requirements", height=150, 
-            help="e.g., 'Must have 3+ years React experience. Must know AWS. Degree required.'")
-            
+        min_reqs = st.text_area(
+            "Mandatory Minimum Requirements", 
+            height=150, 
+            help="e.g., 'Must have 3+ years React experience. Must know AWS. Degree required.'",
+            key="min_reqs"
+        )
+        
         st.divider()
         resumes = st.file_uploader(
             "Upload Resumes (Max 20)", 
@@ -340,10 +542,10 @@ def main():
             st.warning("You uploaded more than 20 resumes. Only processing the first 20.")
             resumes = resumes[:20]
             
-        # Initialize client using auto-detection
-        client = get_genai_client()
+        # Initialize client using our multi-provider get_client
+        client = get_client(provider, api_key)
         if not client:
-            st.error("No authentication credentials found. Please set `GEMINI_API_KEY` or `gcp_service_account` in your Streamlit secrets or environment variables.")
+            st.error(f"No authentication credentials found for {provider}. Please provide an API Key in the settings or environment variables.")
             return
             
         # Prepare inputs
@@ -353,7 +555,7 @@ def main():
         jd_text = extract_text(jd_file) if jd_file else jd_text_manual
         
         # Process
-        results = process_all_resumes_concurrently(client, jd_text, min_reqs, resumes)
+        results = process_all_resumes_concurrently(client, provider, model_name, jd_text, min_reqs, resumes)
         
         # Filter successful results for state
         successful = [r['data'] for r in results if r['status'] == 'success']
@@ -368,6 +570,7 @@ def main():
         if errors:
             for e in errors:
                 st.toast(f"Error processing {e['filename']}: {e['error']}", icon="❌")
+
 
     # --- UI Display ---
     evals = st.session_state.get('evaluations', [])
