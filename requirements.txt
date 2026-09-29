@@ -4,3 +4,5 @@ python-dotenv
 PyMuPDF
 python-docx
 openai
+pytesseract
+Pillow

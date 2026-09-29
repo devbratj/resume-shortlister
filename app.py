@@ -8,9 +8,14 @@ import textwrap
 from typing import Optional
 from dotenv import load_dotenv
 
-# File parsing
+import base64
+import shutil
+
+# File parsing & OCR
 import fitz  # PyMuPDF
 import docx
+import pytesseract
+from PIL import Image
 
 # Gemini SDK
 from google import genai
@@ -197,8 +202,108 @@ def is_resume_page(page_text: str) -> bool:
     return True
 
 
-def extract_text(file) -> str:
-    """Extract text from uploaded PDF or DOCX file (standard mode — all pages)."""
+def get_tesseract_cmd() -> Optional[str]:
+    """Find tesseract executable on Windows or Unix PATH."""
+    try:
+        cmd = shutil.which("tesseract")
+        if cmd:
+            return cmd
+    except Exception:
+        pass
+
+    if os.name == 'nt':
+        common_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            os.path.expanduser(r"~\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"),
+        ]
+        for p in common_paths:
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def ocr_page(page, client=None, provider: str = None, model_name: str = None) -> str:
+    """
+    Renders a PyMuPDF page to an image and performs OCR using:
+    1. PyTesseract (if tesseract binary is installed or on PATH)
+    2. Multimodal LLM Vision fallback (Gemini or OpenAI/OpenRouter) if tesseract binary is unavailable
+    """
+    try:
+        pix = page.get_pixmap(dpi=150)
+        img_bytes = pix.tobytes("png")
+    except Exception:
+        return ""
+
+    # Strategy 1: Fast Local OCR via PyTesseract
+    try:
+        t_cmd = get_tesseract_cmd()
+        if t_cmd:
+            pytesseract.pytesseract.tesseract_cmd = t_cmd
+        img = Image.open(io.BytesIO(img_bytes))
+        ocr_text = pytesseract.image_to_string(img)
+        if ocr_text and len(ocr_text.strip()) > 30:
+            return ocr_text.strip()
+    except Exception:
+        pass
+
+    # Strategy 2: Multimodal LLM Vision Fallback (Zero external binary dependency)
+    if client and provider:
+        try:
+            if provider == "Gemini":
+                resp = client.models.generate_content(
+                    model=model_name or "gemini-2.5-flash",
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                        "Extract and transcribe all text from this scanned resume page accurately and verbatim. Return only the extracted text without any commentary."
+                    ],
+                )
+                if resp and resp.text and len(resp.text.strip()) > 20:
+                    return resp.text.strip()
+            elif provider in ["OpenAI", "OpenRouter"]:
+                b64_img = base64.b64encode(img_bytes).decode("utf-8")
+                resp = client.chat.completions.create(
+                    model=model_name or "gpt-4o-mini",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Extract and transcribe all text from this scanned resume page accurately and verbatim. Return only the extracted text without any commentary."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}}
+                        ]
+                    }],
+                    temperature=0.0
+                )
+                if resp and resp.choices and resp.choices[0].message.content:
+                    return resp.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    return ""
+
+
+def extract_page_text_smart(page, client=None, provider: str = None, model_name: str = None) -> tuple[str, bool]:
+    """
+    Extracts text from a single PDF page.
+    If the page has little or no text (< 80 chars) or contains embedded images with minimal text,
+    it triggers OCR to extract the scanned resume content.
+    Returns: (text, used_ocr)
+    """
+    native_text = page.get_text("text").strip()
+
+    # Check if page is image-based (e.g. scanned resume where get_text only finds "Page 2 of 8")
+    has_images = len(page.get_images()) > 0
+    needs_ocr = len(native_text) < 80 or (has_images and len(native_text) < 200)
+
+    if needs_ocr:
+        ocr_text = ocr_page(page, client=client, provider=provider, model_name=model_name)
+        if len(ocr_text) > len(native_text):
+            return ocr_text, True
+
+    return native_text, False
+
+
+def extract_text(file, client=None, provider: str = None, model_name: str = None) -> str:
+    """Extract text from uploaded PDF or DOCX file (standard mode — with OCR support for scanned pages)."""
     text = ""
     file_bytes = file.read()
 
@@ -206,7 +311,10 @@ def extract_text(file) -> str:
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             for page in doc:
-                text += page.get_text("text") + "\n"
+                p_text, _ = extract_page_text_smart(
+                    page, client=client, provider=provider, model_name=model_name
+                )
+                text += p_text + "\n"
         except Exception as e:
             text = f"Error reading PDF {file.name}: {e}"
 
@@ -229,24 +337,31 @@ def extract_text(file) -> str:
     return text
 
 
-def extract_referral_resume_text(file) -> tuple[str, dict]:
+def extract_referral_resume_text(file, client=None, provider: str = None, model_name: str = None) -> tuple[str, dict]:
     """
     Extract only the resume portion from a referral PDF.
     Returns: (resume_text, extraction_stats)
     
-    Uses heuristic page filtering:
+    Uses heuristic page filtering + smart OCR:
     - Reads each page individually
-    - Keeps only pages that pass the is_resume_page() check
-    - Skips ATS metadata pages (Correspondence, Jobs Applied, Audit Trail, etc.)
+    - If a page is image-based / scanned, runs OCR to extract resume content
+    - Evaluates whether the page is resume vs ATS metadata using is_resume_page()
+    - Keeps only resume pages and skips ATS metadata pages
     """
     file_bytes = file.read()
     file.seek(0)
 
-    stats = {"total_pages": 0, "resume_pages": 0, "skipped_pages": 0, "skipped_page_nums": []}
+    stats = {
+        "total_pages": 0,
+        "resume_pages": 0,
+        "skipped_pages": 0,
+        "skipped_page_nums": [],
+        "ocr_pages": 0,
+    }
 
     if not file.name.lower().endswith('.pdf'):
         # For non-PDF referrals (DOCX, TXT), fall back to standard extraction
-        return extract_text(file), stats
+        return extract_text(file, client=client, provider=provider, model_name=model_name), stats
 
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -254,7 +369,12 @@ def extract_referral_resume_text(file) -> tuple[str, dict]:
         resume_text_parts = []
 
         for page_num, page in enumerate(doc, start=1):
-            page_text = page.get_text("text")
+            page_text, used_ocr = extract_page_text_smart(
+                page, client=client, provider=provider, model_name=model_name
+            )
+            if used_ocr:
+                stats["ocr_pages"] += 1
+
             if is_resume_page(page_text):
                 resume_text_parts.append(page_text)
                 stats["resume_pages"] += 1
@@ -264,9 +384,13 @@ def extract_referral_resume_text(file) -> tuple[str, dict]:
 
         resume_text = "\n".join(resume_text_parts)
 
-        # Safety fallback: if we filtered out everything, return all text
+        # Safety fallback: if we filtered out everything, return all text with OCR
         if not resume_text.strip():
-            resume_text = "\n".join(p.get_text("text") for p in doc)
+            fallback_parts = []
+            for page in doc:
+                p_text, _ = extract_page_text_smart(page, client=client, provider=provider, model_name=model_name)
+                fallback_parts.append(p_text)
+            resume_text = "\n".join(fallback_parts)
             stats["skipped_pages"] = 0
             stats["resume_pages"] = stats["total_pages"]
             stats["skipped_page_nums"] = []
@@ -275,6 +399,7 @@ def extract_referral_resume_text(file) -> tuple[str, dict]:
 
     except Exception as e:
         return f"Error reading referral PDF {file.name}: {e}", stats
+
 
 
 def clean_resume_with_llm(client, provider: str, model_name: str, raw_text: str) -> str:
@@ -424,8 +549,10 @@ def process_all_resumes_concurrently(client, provider: str, model_name: str, jd_
     resume_data = []
     for r in resumes:
         if source == "Referral":
-            # Step 1: Heuristic page filtering
-            text, stats = extract_referral_resume_text(r)
+            # Step 1: Heuristic page filtering with smart OCR for scanned pages
+            text, stats = extract_referral_resume_text(
+                r, client=client, provider=provider, model_name=model_name
+            )
 
             # Step 2: Optional LLM-based cleaning pass
             if use_llm_cleaning and text.strip():
@@ -434,8 +561,9 @@ def process_all_resumes_concurrently(client, provider: str, model_name: str, jd_
 
             resume_data.append((r.name, text, stats))
         else:
-            text = extract_text(r)
+            text = extract_text(r, client=client, provider=provider, model_name=model_name)
             resume_data.append((r.name, text, {}))
+
 
     with st.spinner(f"Analyzing {len(resume_data)} resumes with {provider} ({model_name})..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -782,14 +910,14 @@ def main():
         st.session_state['evaluations'] = []
         st.session_state['selected_candidate'] = None
 
-        jd_text = extract_text(jd_file) if jd_file else jd_text_manual
+        jd_text = extract_text(jd_file, client=client, provider=provider, model_name=model_name) if jd_file else jd_text_manual
 
         # Determine source string
         source = "Referral" if is_referral else "Standard"
 
         # Show referral mode banner
         if is_referral:
-            st.info(f"🔗 **Referral Mode**: Processing {len(resumes)} referral PDF(s). Filtering ATS metadata pages automatically.")
+            st.info(f"🔗 **Referral Mode**: Processing {len(resumes)} referral PDF(s). Filtering ATS metadata pages and OCR-extracting scanned resume pages automatically.")
 
         # Process
         results = process_all_resumes_concurrently(
@@ -815,13 +943,16 @@ def main():
                     if stats.get('total_pages', 0) > 0:
                         skipped = stats.get('skipped_pages', 0)
                         total = stats.get('total_pages', 0)
+                        kept = stats.get('resume_pages', 0)
+                        ocr_count = stats.get('ocr_pages', 0)
                         skipped_nums = stats.get('skipped_page_nums', [])
                         fname = r['data'].get('filename', '')
-                        if skipped > 0:
-                            st.toast(
-                                f"📄 {fname}: Filtered {skipped}/{total} ATS pages (pages {skipped_nums})",
-                                icon="🔗"
-                            )
+                        ocr_msg = f" ({ocr_count} scanned pages OCR'd)" if ocr_count > 0 else ""
+                        st.toast(
+                            f"📄 {fname}: Kept {kept}/{total} pages{ocr_msg}. Filtered ATS pages: {skipped_nums}",
+                            icon="🔗"
+                        )
+
 
         if errors:
             for e in errors:
@@ -930,13 +1061,16 @@ def main():
                 if is_sel_referral and stats.get('total_pages', 0) > 0:
                     kept = stats.get('resume_pages', 0)
                     total = stats.get('total_pages', 0)
+                    ocr_count = stats.get('ocr_pages', 0)
                     skipped_nums = stats.get('skipped_page_nums', [])
+                    ocr_note = f" (<b>{ocr_count}</b> scanned page(s) OCR'd)" if ocr_count > 0 else ""
                     stats_html = (
                         f'<div style="background:#1e3a4c;border:1px solid #0ea5e9;border-radius:8px;'
                         f'padding:10px 14px;margin-bottom:16px;font-size:0.85em;color:#7dd3fc;">'
-                        f'🔍 Referral extraction: <b>{kept}/{total} pages</b> kept as resume content. '
+                        f'🔍 Referral extraction: <b>{kept}/{total} pages</b> kept as resume content{ocr_note}. '
                         f'Skipped ATS pages: {skipped_nums if skipped_nums else "none"}.</div>'
                     )
+
 
                 mand_skills_html = "".join([
                     f"<li><b>{s.get('skill_name', '')}</b>: "
