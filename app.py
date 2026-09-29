@@ -157,17 +157,18 @@ ATS_PAGE_SIGNALS = [
 # Resume content signals — pages with these phrases are likely resume content
 RESUME_PAGE_SIGNALS = [
     "PROFESSIONAL SUMMARY", "PROFESSIONAL EXPERIENCE", "WORK EXPERIENCE",
-    "TECHNICAL SKILLS", "SKILLS", "EDUCATION", "OBJECTIVE", "CERTIFICATIONS",
+    "TECHNICAL SKILLS", "EDUCATION", "OBJECTIVE", "CERTIFICATIONS",
     "ACHIEVEMENTS", "PROJECTS", "KEY RESPONSIBILITIES", "ROLES & RESPONSIBILITIES",
-    "EMPLOYMENT", "EXPERIENCE", "ACADEMIC", "QUALIFICATION",
-    "GCP", "BigQuery", "Python", "Java", "SQL", "Data Engineer", "Cloud"
+    "EMPLOYMENT HISTORY", "ACADEMIC QUALIFICATION",
+    "Data Engineer", "Data Warehousing", "ETL/ELT", "Apache Airflow",
+    "Cloud Composer", "Dataflow", "BigQuery", "Dataproc",
 ]
 
 def is_resume_page(page_text: str) -> bool:
     """
     Heuristic check: returns True if a page looks like resume content,
     False if it looks like ATS system metadata.
-    
+
     Logic:
     - Count how many ATS signals appear on the page
     - Count how many resume signals appear on the page
@@ -184,7 +185,11 @@ def is_resume_page(page_text: str) -> bool:
     ats_hits = sum(1 for signal in ATS_PAGE_SIGNALS if signal.upper() in text_upper)
     resume_hits = sum(1 for signal in RESUME_PAGE_SIGNALS if signal.upper() in text_upper)
 
-    # If the page has strong ATS signals and weak resume signals → skip
+    # Very high ATS signal count → definitely a system/metadata page
+    if ats_hits >= 8 and resume_hits < 3:
+        return False
+
+    # Moderate ATS signals with weak resume signals → skip
     if ats_hits >= 3 and resume_hits < 2:
         return False
 
