@@ -284,30 +284,41 @@ def ocr_page(page, client=None, provider: str = None, model_name: str = None) ->
 def extract_page_text_smart(page, client=None, provider: str = None, model_name: str = None) -> tuple[str, bool]:
     """
     Extracts text from a single PDF page.
-    If the page has little or no text (< 80 chars) or contains embedded images with minimal text,
-    it triggers OCR to extract the scanned resume content.
+    Only triggers OCR if the page has negligible native text (< 80 chars) AND has embedded images.
     Returns: (text, used_ocr)
     """
     native_text = page.get_text("text").strip()
 
-    # Check if page is image-based (e.g. scanned resume where get_text only finds "Page 2 of 8")
-    has_images = len(page.get_images()) > 0
-    needs_ocr = len(native_text) < 80 or (has_images and len(native_text) < 200)
+    # Fast path: If page already has 80+ chars of selectable text, it's NOT a scanned image page!
+    if len(native_text) >= 80:
+        return native_text, False
 
-    if needs_ocr:
-        ocr_text = ocr_page(page, client=client, provider=provider, model_name=model_name)
-        if len(ocr_text) > len(native_text):
-            return ocr_text, True
+    # Check if there are actual images on this page
+    has_images = len(page.get_images()) > 0
+    if not has_images:
+        # Blank or separator page without images — no need to OCR
+        return native_text, False
+
+    # Scanned image page with < 80 characters of native text: run OCR
+    ocr_text = ocr_page(page, client=client, provider=provider, model_name=model_name)
+    if len(ocr_text) > len(native_text):
+        return ocr_text, True
 
     return native_text, False
 
 
-def extract_text(file, client=None, provider: str = None, model_name: str = None) -> str:
+def extract_text(file_or_bytes, filename: str = "", client=None, provider: str = None, model_name: str = None) -> str:
     """Extract text from uploaded PDF or DOCX file (standard mode — with OCR support for scanned pages)."""
     text = ""
-    file_bytes = file.read()
+    if isinstance(file_or_bytes, bytes):
+        file_bytes = file_or_bytes
+        fname = filename or "document.pdf"
+    else:
+        file_bytes = file_or_bytes.read()
+        fname = getattr(file_or_bytes, "name", filename or "document.pdf")
+        file_or_bytes.seek(0)
 
-    if file.name.lower().endswith('.pdf'):
+    if fname.lower().endswith('.pdf'):
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             for page in doc:
@@ -316,15 +327,15 @@ def extract_text(file, client=None, provider: str = None, model_name: str = None
                 )
                 text += p_text + "\n"
         except Exception as e:
-            text = f"Error reading PDF {file.name}: {e}"
+            text = f"Error reading PDF {fname}: {e}"
 
-    elif file.name.lower().endswith('.docx'):
+    elif fname.lower().endswith('.docx'):
         try:
             doc = docx.Document(io.BytesIO(file_bytes))
             for para in doc.paragraphs:
                 text += para.text + "\n"
         except Exception as e:
-            text = f"Error reading DOCX {file.name}: {e}"
+            text = f"Error reading DOCX {fname}: {e}"
     else:
         # Fallback for txt
         try:
@@ -332,12 +343,10 @@ def extract_text(file, client=None, provider: str = None, model_name: str = None
         except:
             text = "Unsupported file format."
 
-    # Reset pointer for Streamlit just in case
-    file.seek(0)
     return text
 
 
-def extract_referral_resume_text(file, client=None, provider: str = None, model_name: str = None) -> tuple[str, dict]:
+def extract_referral_resume_text(file_or_bytes, filename: str = "", client=None, provider: str = None, model_name: str = None) -> tuple[str, dict]:
     """
     Extract only the resume portion from a referral PDF.
     Returns: (resume_text, extraction_stats)
@@ -348,8 +357,13 @@ def extract_referral_resume_text(file, client=None, provider: str = None, model_
     - Evaluates whether the page is resume vs ATS metadata using is_resume_page()
     - Keeps only resume pages and skips ATS metadata pages
     """
-    file_bytes = file.read()
-    file.seek(0)
+    if isinstance(file_or_bytes, bytes):
+        file_bytes = file_or_bytes
+        fname = filename or "referral.pdf"
+    else:
+        file_bytes = file_or_bytes.read()
+        fname = getattr(file_or_bytes, "name", filename or "referral.pdf")
+        file_or_bytes.seek(0)
 
     stats = {
         "total_pages": 0,
@@ -359,9 +373,9 @@ def extract_referral_resume_text(file, client=None, provider: str = None, model_
         "ocr_pages": 0,
     }
 
-    if not file.name.lower().endswith('.pdf'):
+    if not fname.lower().endswith('.pdf'):
         # For non-PDF referrals (DOCX, TXT), fall back to standard extraction
-        return extract_text(file, client=client, provider=provider, model_name=model_name), stats
+        return extract_text(file_bytes, filename=fname, client=client, provider=provider, model_name=model_name), stats
 
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -398,7 +412,8 @@ def extract_referral_resume_text(file, client=None, provider: str = None, model_
         return resume_text, stats
 
     except Exception as e:
-        return f"Error reading referral PDF {file.name}: {e}", stats
+        return f"Error reading referral PDF {fname}: {e}", stats
+
 
 
 
@@ -539,57 +554,102 @@ def process_single_resume(client, provider: str, model_name: str, resume_text: s
         return {"status": "error", "filename": filename, "error": str(e)}
 
 
+def process_single_candidate_pipeline(
+    filename: str,
+    file_bytes: bytes,
+    client,
+    provider: str,
+    model_name: str,
+    jd_text: str,
+    min_reqs: str,
+    source: str = "Standard",
+    use_llm_cleaning: bool = False
+) -> dict:
+    """Processes a single candidate file end-to-end: extraction (with OCR), optional cleaning, and evaluation."""
+    try:
+        # Step 1: Extraction
+        if source == "Referral":
+            resume_text, stats = extract_referral_resume_text(
+                file_bytes, filename=filename, client=client, provider=provider, model_name=model_name
+            )
+            if use_llm_cleaning and resume_text.strip():
+                resume_text = clean_resume_with_llm(client, provider, model_name, resume_text)
+        else:
+            resume_text = extract_text(
+                file_bytes, filename=filename, client=client, provider=provider, model_name=model_name
+            )
+            stats = {}
+
+        # Step 2: Evaluation
+        eval_result = process_single_resume(
+            client, provider, model_name, resume_text, filename, jd_text, min_reqs, source=source
+        )
+        if eval_result.get("status") == "success" and stats:
+            eval_result["data"]["_extraction_stats"] = stats
+
+        return eval_result
+    except Exception as e:
+        return {"status": "error", "filename": filename, "error": str(e)}
+
+
 def process_all_resumes_concurrently(client, provider: str, model_name: str, jd_text: str, min_reqs: str,
                                       resumes, source: str = "Standard",
                                       use_llm_cleaning: bool = False) -> list:
-    """Process multiple resumes in parallel using ThreadPoolExecutor."""
+    """
+    Process multiple resumes in parallel using ThreadPoolExecutor.
+    Displays live progress bar and status updates from the very start.
+    """
+    total_count = len(resumes)
     results = []
 
-    # Pre-extract text synchronously to avoid passing BytesIO across threads
-    resume_data = []
+    # Read uploaded file bytes in memory immediately (< 0.05s)
+    file_payloads = []
     for r in resumes:
-        if source == "Referral":
-            # Step 1: Heuristic page filtering with smart OCR for scanned pages
-            text, stats = extract_referral_resume_text(
-                r, client=client, provider=provider, model_name=model_name
-            )
+        b = r.read()
+        r.seek(0)
+        file_payloads.append((r.name, b))
 
-            # Step 2: Optional LLM-based cleaning pass
-            if use_llm_cleaning and text.strip():
-                with st.spinner(f"🧹 LLM cleaning referral: {r.name} ({stats['resume_pages']}/{stats['total_pages']} pages kept)..."):
-                    text = clean_resume_with_llm(client, provider, model_name, text)
+    # Initialize live UI progress indicators IMMEDIATELY
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
 
-            resume_data.append((r.name, text, stats))
-        else:
-            text = extract_text(r, client=client, provider=provider, model_name=model_name)
-            resume_data.append((r.name, text, {}))
+    progress_bar = progress_placeholder.progress(0.0)
+    status_placeholder.info(f"⚡ Analyzing {total_count} candidate(s) in parallel with {provider} ({model_name})...")
 
+    # Run extraction, OCR, and evaluation concurrently in parallel threads
+    max_workers = min(total_count, 6)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_name = {
+            executor.submit(
+                process_single_candidate_pipeline,
+                name, b, client, provider, model_name, jd_text, min_reqs, source, use_llm_cleaning
+            ): name
+            for name, b in file_payloads
+        }
 
-    with st.spinner(f"Analyzing {len(resume_data)} resumes with {provider} ({model_name})..."):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_resume = {
-                executor.submit(
-                    process_single_resume, client, provider, model_name,
-                    text, name, jd_text, min_reqs, source
-                ): (name, stats)
-                for name, text, stats in resume_data
-            }
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_name):
+            res = future.result()
+            results.append(res)
+            completed += 1
+            progress_bar.progress(completed / total_count)
 
-            # Progress bar setup
-            progress_bar = st.progress(0)
-            completed = 0
+            # Live feedback as each candidate finishes
+            if res.get("status") == "success":
+                c_name = res["data"].get("candidate_name", future_to_name[future])
+                m_pct = res["data"].get("match_percentage", 0)
+                status_placeholder.markdown(
+                    f"🔄 **[{completed}/{total_count}]** Completed: **{c_name}** (`{m_pct}% Match`)"
+                )
+            else:
+                status_placeholder.markdown(
+                    f"⚠️ **[{completed}/{total_count}]** Completed with error: `{future_to_name[future]}`"
+                )
 
-            for future in concurrent.futures.as_completed(future_to_resume):
-                res = future.result()
-                name, stats = future_to_resume[future]
-                # Attach extraction stats to result for display
-                if res["status"] == "success" and stats:
-                    res["data"]["_extraction_stats"] = stats
-                results.append(res)
-                completed += 1
-                progress_bar.progress(completed / len(resume_data))
-
+    progress_bar.progress(1.0)
+    status_placeholder.success(f"✅ Successfully evaluated all {total_count} candidate(s)!")
     return results
+
 
 
 def get_client(provider: str, api_key: str):
